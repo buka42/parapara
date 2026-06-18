@@ -1,0 +1,24 @@
+# --- Transkrypcja offline ---
+faster-whisper>=1.0.0
+onnxruntime>=1.16          # wymagane przez filtr VAD w faster-whisper
+
+# --- Audio ---
+sounddevice>=0.4.6         # nasłuch mikrofonu (potrzebuje PortAudio w systemie)
+numpy>=1.24
+
+# --- RAG / baza wiedzy ---
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-ollama>=0.1.3
+langchain-text-splitters>=0.2.0
+faiss-cpu>=1.8.0
+pypdf>=4.0                 # ładowanie plików .pdf
+
+# --- LLM lokalny ---
+ollama>=0.2.0              # klient Pythona dla serwera Ollama
+
+# --- Globalny skrót klawiszowy ---
+keyboard>=0.13.5           # na Linux wymaga uprawnień root
+
+# --- GUI (pływające okno, always-on-top) ---
+PyQt6>=6.6

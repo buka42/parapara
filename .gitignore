@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Środowiska wirtualne
+.venv/
+venv/
+env/
+
+# Wygenerowany indeks wektorowy (odtwarzany przez `python ingest.py`)
+faiss_index/
+
+# Cache modeli pobieranych lokalnie
+.cache/
+
+# Różne
+*.log
+.DS_Store

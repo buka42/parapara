@@ -1,0 +1,37 @@
+Przykładowe notatki — podstawy sieci komputerowych
+===================================================
+
+Model OSI
+---------
+Model OSI dzieli komunikację sieciową na 7 warstw:
+1. Fizyczna – przesyłanie surowych bitów przez medium (kable, fale radiowe).
+2. Łącza danych – ramki, adresy MAC, wykrywanie błędów (np. Ethernet).
+3. Sieciowa – adresacja logiczna i trasowanie pakietów (IP).
+4. Transportowa – niezawodny lub zawodny transport (TCP, UDP).
+5. Sesji – nawiązywanie i utrzymywanie sesji między aplikacjami.
+6. Prezentacji – kodowanie, kompresja i szyfrowanie danych.
+7. Aplikacji – protokoły widoczne dla użytkownika (HTTP, DNS, SMTP).
+
+TCP kontra UDP
+--------------
+TCP (Transmission Control Protocol) jest połączeniowy i niezawodny: gwarantuje
+dostarczenie danych w kolejności, stosuje potwierdzenia i retransmisje oraz
+kontrolę przepływu. Używany tam, gdzie liczy się kompletność danych
+(np. strony WWW, poczta, pobieranie plików).
+
+UDP (User Datagram Protocol) jest bezpołączeniowy i zawodny: nie gwarantuje
+dostarczenia ani kolejności, ale ma mniejszy narzut i mniejsze opóźnienia.
+Stosowany w transmisji na żywo, grach online i DNS.
+
+Adresacja IP
+------------
+Adres IPv4 ma 32 bity i zapisywany jest jako cztery liczby 0–255 (np. 192.168.0.1).
+Adres IPv6 ma 128 bitów i zapisywany jest szesnastkowo. Maska podsieci określa,
+która część adresu to sieć, a która host. Adresy prywatne (np. 192.168.0.0/16,
+10.0.0.0/8) nie są trasowane w publicznym Internecie.
+
+DNS
+---
+DNS (Domain Name System) tłumaczy nazwy domen (np. example.com) na adresy IP.
+Działa jak rozproszona książka telefoniczna Internetu i domyślnie korzysta
+z protokołu UDP na porcie 53.
