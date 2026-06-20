@@ -17,6 +17,18 @@ BASE_DIR = Path(__file__).resolve().parent
 NOTES_DIR = BASE_DIR / "notatki"        # folder z notatkami (.txt, .md, .pdf)
 INDEX_DIR = BASE_DIR / "faiss_index"    # tu zapisywany jest indeks wektorowy
 
+# --- Klucze API (.env) -----------------------------------------------------
+# Wczytujemy plik `.env` z katalogu projektu, dzięki czemu kluczy
+# (ANTHROPIC_API_KEY, OPENAI_API_KEY) nie trzeba eksportować przy każdym
+# uruchomieniu. python-dotenv jest opcjonalne — bez niego nadal działają
+# zwykłe zmienne środowiskowe (mają one pierwszeństwo nad plikiem .env).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:  # pragma: no cover
+    pass
+
 # --- Audio / nasłuch -------------------------------------------------------
 # Trzymamy "rolling buffer" SUROWEGO dźwięku z ostatnich BUFFER_SECONDS sekund
 # i transkrybujemy go dopiero po wciśnięciu F12 (jeden request do chmury).

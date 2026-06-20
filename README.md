@@ -51,10 +51,15 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 # 2) zależności Pythona
 pip install -r requirements.txt
 
-# 3) klucze API (w tej samej sesji terminala, w której uruchamiasz program)
-export ANTHROPIC_API_KEY=sk-ant-...     # Windows: setx ANTHROPIC_API_KEY sk-ant-...
-export OPENAI_API_KEY=sk-...            # Windows: setx OPENAI_API_KEY sk-...
+# 3) klucze API — wpisz je RAZ do pliku .env (nie trzeba ich potem eksportować)
+cp .env.example .env                # Windows: copy .env.example .env
+#    następnie otwórz plik .env i wklej swoje klucze
 ```
+
+Plik `.env` jest na liście `.gitignore`, więc Twoje klucze **nie trafią do
+repozytorium**. Aplikacja wczytuje go automatycznie przy starcie (przez
+`python-dotenv`). Zwykłe zmienne środowiskowe (`export ...`) nadal działają i
+mają pierwszeństwo nad `.env`.
 
 ---
 
@@ -172,6 +177,7 @@ się” nagrywania na obsługę GUI):
 | `ingest.py` | **Moduł A** — budowa indeksu FAISS z notatek |
 | `main.py` | **Moduł B** — nasłuch, F12, transkrypcja, RAG, okno |
 | `requirements.txt` | zależności Pythona |
+| `.env.example` | szablon kluczy API (skopiuj do `.env` i uzupełnij) |
 | `notatki/` | Twoje materiały (`.txt`, `.md`, `.pdf`) |
 | `faiss_index/` | wygenerowany indeks wektorowy (nie wersjonowany) |
 
@@ -181,7 +187,7 @@ się” nagrywania na obsługę GUI):
 
 | Objaw | Przyczyna / rozwiązanie |
 |---|---|
-| `Brak zmiennych środowiskowych: ...` | ustaw `ANTHROPIC_API_KEY` i `OPENAI_API_KEY` w tej samej sesji |
+| `Brak zmiennych środowiskowych: ...` | utwórz `.env` (`cp .env.example .env`) i wpisz oba klucze |
 | `Nie znaleziono indeksu wiedzy` | uruchom najpierw `python ingest.py` |
 | `Błąd Claude API` / `Błąd OpenAI API` | sprawdź poprawność kluczy, limity konta i połączenie z siecią |
 | Brak reakcji na F12 (Linux) | uruchom `sudo -E python main.py`; pod Wayland przełącz się na X11 |

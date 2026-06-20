@@ -14,6 +14,9 @@ faiss_index/
 # Cache modeli pobieranych lokalnie
 .cache/
 
+# Klucze API — NIE commituj prawdziwych kluczy! (szablon: .env.example)
+.env
+
 # Różne
 *.log
 .DS_Store

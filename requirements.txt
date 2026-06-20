@@ -4,6 +4,9 @@ anthropic>=0.40
 # --- Transkrypcja (Whisper) + embeddingi w chmurze (OpenAI) ---
 openai>=1.40
 
+# --- Wczytywanie kluczy API z pliku .env ---
+python-dotenv>=1.0
+
 # --- Audio (przechwytywanie mikrofonu lokalnie) ---
 sounddevice>=0.4.6         # potrzebuje biblioteki systemowej PortAudio
 numpy>=1.24
