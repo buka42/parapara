@@ -3,14 +3,17 @@ ingest.py — Moduł A: przygotowanie bazy wiedzy (RAG).
 
 Ładuje pliki .txt / .md / .pdf z folderu `notatki/`, dzieli ich treść na
 fragmenty (chunking) i buduje lokalny indeks wektorowy FAISS przy użyciu
-embeddingów liczonych lokalnie przez Ollamę. Indeks zapisywany jest na dysk
-(`faiss_index/`) i wczytywany później przez main.py.
+embeddingów OpenAI. Indeks zapisywany jest na dysk (`faiss_index/`) i
+wczytywany później przez main.py.
+
+Wymaga zmiennej środowiskowej OPENAI_API_KEY.
 
 Uruchomienie:
     python ingest.py
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -21,7 +24,6 @@ try:
     from langchain_community.document_loaders import PyPDFLoader, TextLoader
     from langchain_community.vectorstores import FAISS
     from langchain_core.documents import Document
-    from langchain_ollama import OllamaEmbeddings
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ImportError as exc:  # pragma: no cover
     print(
@@ -83,6 +85,13 @@ def load_documents(notes_dir: Path) -> list[Document]:
 
 def build_index() -> None:
     """Pełny przebieg: wczytanie -> chunking -> embeddingi -> zapis indeksu."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "Brak zmiennej środowiskowej OPENAI_API_KEY. Ustaw ją przed uruchomieniem, np.:\n"
+            "    export OPENAI_API_KEY=sk-...        (Linux/macOS)\n"
+            "    setx OPENAI_API_KEY sk-...          (Windows)"
+        )
+
     print(f"[1/4] Wczytywanie notatek z: {config.NOTES_DIR}")
     documents = load_documents(config.NOTES_DIR)
     print(f"      Łącznie wczytano {len(documents)} dokumentów źródłowych.")
@@ -99,16 +108,14 @@ def build_index() -> None:
         raise ValueError("Po podziale nie powstały żadne fragmenty — sprawdź notatki.")
     print(f"      Powstało {len(chunks)} fragmentów.")
 
-    print(f"[3/4] Liczenie embeddingów modelem Ollama '{config.OLLAMA_EMBED_MODEL}'…")
-    print("      (upewnij się, że Ollama działa: `ollama serve`)")
-    embeddings = OllamaEmbeddings(model=config.OLLAMA_EMBED_MODEL)
+    print(f"[3/4] Liczenie embeddingów modelem OpenAI '{config.OPENAI_EMBED_MODEL}'…")
+    embeddings = config.build_embeddings()
     try:
         vector_store = FAISS.from_documents(chunks, embeddings)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
-            "Nie udało się policzyć embeddingów. Sprawdź, czy serwer Ollama "
-            "działa oraz czy pobrano model:\n"
-            f"    ollama pull {config.OLLAMA_EMBED_MODEL}\n"
+            "Nie udało się policzyć embeddingów. Sprawdź, czy klucz OPENAI_API_KEY "
+            "jest poprawny i czy masz dostęp do internetu.\n"
             f"Szczegóły: {exc}"
         ) from exc
 

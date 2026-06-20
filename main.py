@@ -1,37 +1,43 @@
 """
-main.py — Moduł B: aplikacja główna "Półautomatyczny asystent wiedzy".
+main.py — Moduł B: aplikacja główna "Półautomatyczny asystent wiedzy" (chmura).
 
 Co robi:
-  * w tle nasłuchuje mikrofonu (sounddevice) i ciągle transkrybuje mowę
-    modelem faster-whisper, utrzymując "rolling buffer" tekstu z ostatnich
-    ~30 sekund (starszy tekst jest automatycznie usuwany),
+  * w tle nasłuchuje mikrofonu (sounddevice) i trzyma w pamięci "rolling buffer"
+    SUROWEGO dźwięku z ostatnich ~30 sekund (starsze próbki są usuwane),
   * po wciśnięciu globalnego skrótu F12:
-        1. pobiera bieżącą zawartość bufora,
-        2. prosi lokalny model w Ollamie o wyodrębnienie pytania,
-        3. przeszukuje notatki (RAG / FAISS),
-        4. generuje zwięzłą odpowiedź WYŁĄCZNIE na bazie znalezionych
+        1. pobiera ostatnie ~30 s dźwięku z bufora,
+        2. transkrybuje je w chmurze (OpenAI Whisper),
+        3. prosi Claude (Anthropic API) o wyodrębnienie pytania,
+        4. przeszukuje notatki (RAG / FAISS, embeddingi OpenAI),
+        5. Claude generuje zwięzłą odpowiedź WYŁĄCZNIE na bazie znalezionych
            fragmentów,
-        5. pokazuje wynik w pływającym oknie (always-on-top).
+        6. wynik pojawia się w pływającym oknie (always-on-top).
+
+Dlaczego transkrypcja "na żądanie", a nie ciągła?
+  Transkrypcja jest teraz w chmurze, więc ciągłe transkrybowanie generowałoby
+  stały ruch i koszt. Zamiast tego trzymamy tani bufor surowego dźwięku i
+  wysyłamy do chmury JEDEN request — dopiero po wciśnięciu F12.
 
 Model wątków (kluczowy, by GUI się nie zacinało — szczegóły w README.md):
   * wątek główny ............ pętla zdarzeń PyQt6 (GUI),
-  * wątek PortAudio (callback) wrzuca próbki audio do kolejki,
-  * wątek transkrypcji ...... faster-whisper -> rolling buffer tekstu,
+  * wątek PortAudio (callback) dopisuje próbki do rolling buffera (pod blokadą),
   * wątek biblioteki keyboard uruchamia wątek "pipeline" po wciśnięciu F12,
-  * wątek pipeline .......... wolne operacje LLM/RAG; wynik do GUI WYŁĄCZNIE
-                             przez sygnały Qt (bezpieczne między wątkami).
+  * wątek pipeline .......... wolne operacje sieciowe (OpenAI + Claude + RAG);
+                             wynik do GUI WYŁĄCZNIE przez sygnały Qt.
 
+Wymaga zmiennych środowiskowych: ANTHROPIC_API_KEY oraz OPENAI_API_KEY.
 Uruchomienie:
     python main.py
-(wymaga wcześniejszego `python ingest.py` oraz działającego serwera Ollama)
+(wymaga wcześniejszego `python ingest.py`)
 """
 from __future__ import annotations
 
-import queue
+import io
+import os
 import signal
 import sys
 import threading
-import time
+import wave
 from collections import deque
 
 import numpy as np
@@ -40,12 +46,11 @@ import config
 
 # Importy zewnętrzne opakowane w czytelny komunikat o brakujących zależnościach.
 try:
+    import anthropic
     import keyboard
     import sounddevice as sd
-    from faster_whisper import WhisperModel
+    from openai import OpenAI, OpenAIError
     from langchain_community.vectorstores import FAISS
-    from langchain_core.messages import HumanMessage, SystemMessage
-    from langchain_ollama import ChatOllama, OllamaEmbeddings
     from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
     from PyQt6.QtWidgets import (
         QApplication,
@@ -68,7 +73,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# Prompty systemowe dla modelu LLM
+# Prompty systemowe dla modelu LLM (Claude)
 # ---------------------------------------------------------------------------
 EXTRACT_SYSTEM_PROMPT = (
     "Jesteś asystentem, który z transkrypcji mowy wyodrębnia główne pytanie. "
@@ -80,9 +85,9 @@ EXTRACT_SYSTEM_PROMPT = (
 
 ANSWER_SYSTEM_PROMPT = (
     "Jesteś precyzyjnym asystentem wiedzy. Odpowiadasz po polsku — krótko i "
-    "zwięźle. Odpowiedz na pytanie WYŁĄCZNIE na podstawie podanych fragmentów "
-    "notatek. Nie korzystaj z wiedzy spoza notatek. Jeśli w notatkach nie ma "
-    "odpowiedzi, napisz dokładnie: 'Brak informacji w notatkach.'"
+    "zwięźle, bez wstępów. Odpowiedz na pytanie WYŁĄCZNIE na podstawie podanych "
+    "fragmentów notatek. Nie korzystaj z wiedzy spoza notatek. Jeśli w notatkach "
+    "nie ma odpowiedzi, napisz dokładnie: 'Brak informacji w notatkach.'"
 )
 
 # Styl pływającego okna (ciemne, półprzezroczyste, zaokrąglone).
@@ -108,19 +113,67 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 """
 
 
-# ---------------------------------------------------------------------------
-# Audio: ciągły nasłuch mikrofonu -> kolejka próbek
-# ---------------------------------------------------------------------------
-class AudioListener:
-    """Nasłuchuje mikrofonu i wrzuca bloki próbek (float32, mono) do kolejki.
+def _wav_bytes_from_float32(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Konwertuje próbki float32 [-1, 1] (mono) na bajty pliku WAV (PCM 16-bit)."""
+    pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)  # 16-bit
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm16.tobytes())
+    return buffer.getvalue()
 
-    Callback sounddevice działa na osobnym wątku PortAudio, dlatego MUSI być
-    krótki i nieblokujący — całe "ciężkie" przetwarzanie odbywa się w wątku
-    transkrypcji.
+
+def _message_text(message) -> str:
+    """Składa tekst z bloków odpowiedzi Claude (pomija ewentualne bloki myślenia)."""
+    return "".join(block.text for block in message.content if block.type == "text")
+
+
+# ---------------------------------------------------------------------------
+# Rolling buffer surowego dźwięku (ostatnie BUFFER_SECONDS sekund)
+# ---------------------------------------------------------------------------
+class AudioRingBuffer:
+    """Bezpieczny wątkowo bufor trzymający ostatnie ~N sekund próbek audio.
+
+    Producent (callback PortAudio) dokłada bloki; gdy bufor przekroczy limit,
+    najstarsze próbki są usuwane. Konsument (pipeline F12) robi migawkę.
     """
 
-    def __init__(self, audio_queue: "queue.Queue[np.ndarray]") -> None:
-        self._queue = audio_queue
+    def __init__(self, max_seconds: float, sample_rate: int) -> None:
+        self._max_samples = int(max_seconds * sample_rate)
+        self._blocks: "deque[np.ndarray]" = deque()
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def add(self, block: np.ndarray) -> None:
+        with self._lock:
+            self._blocks.append(block)
+            self._count += len(block)
+            # Usuwamy najstarsze bloki, aż zmieścimy się w limicie.
+            while self._count > self._max_samples and len(self._blocks) > 1:
+                self._count -= len(self._blocks.popleft())
+
+    def snapshot(self) -> np.ndarray:
+        """Zwraca kopię całego bufora jako jedną tablicę float32 (lub pustą)."""
+        with self._lock:
+            if not self._blocks:
+                return np.empty(0, dtype=np.float32)
+            return np.concatenate(list(self._blocks))
+
+
+# ---------------------------------------------------------------------------
+# Audio: ciągły nasłuch mikrofonu -> rolling buffer
+# ---------------------------------------------------------------------------
+class AudioListener:
+    """Nasłuchuje mikrofonu i dopisuje bloki próbek do rolling buffera.
+
+    Callback sounddevice działa na osobnym wątku PortAudio i jest minimalny —
+    tylko kopiuje próbki do bufora.
+    """
+
+    def __init__(self, ring: AudioRingBuffer) -> None:
+        self._ring = ring
         self._stream: "sd.InputStream | None" = None
 
     def start(self) -> None:
@@ -137,18 +190,8 @@ class AudioListener:
         if status:
             # Np. przepełnienia bufora — tylko logujemy, nie przerywamy nasłuchu.
             print(f"[audio] status: {status}", file=sys.stderr)
-        # Bierzemy pierwszy (jedyny) kanał i KOPIUJEMY — bufor jest reużywany.
-        block = indata[:, 0].copy()
-        try:
-            self._queue.put_nowait(block)
-        except queue.Full:
-            # Transkrypcja nie nadąża: usuwamy najstarszy blok, by trzymać się
-            # "na żywo" zamiast budować rosnące opóźnienie.
-            try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(block)
-            except queue.Empty:
-                pass
+        # Pierwszy (jedyny) kanał; KOPIUJEMY — bufor sounddevice jest reużywany.
+        self._ring.add(indata[:, 0].copy())
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -160,116 +203,62 @@ class AudioListener:
 
 
 # ---------------------------------------------------------------------------
-# Transkrypcja: kolejka próbek -> rolling buffer tekstu
+# Transkrypcja w chmurze (OpenAI Whisper)
 # ---------------------------------------------------------------------------
-class RollingTranscriber(threading.Thread):
-    """Wątek roboczy: pobiera próbki z kolejki, transkrybuje je w paczkach po
-    CHUNK_SECONDS i utrzymuje rolling buffer tekstu z ostatnich BUFFER_SECONDS.
+class CloudTranscriber:
+    """Transkrybuje surowy dźwięk przez API OpenAI (Whisper)."""
 
-    Paczki nie nakładają się na siebie, więc tekst nie duplikuje się w buforze.
-    """
-
-    def __init__(self, model: WhisperModel, audio_queue: "queue.Queue[np.ndarray]") -> None:
-        super().__init__(name="RollingTranscriber", daemon=True)
+    def __init__(self, client: OpenAI, model: str) -> None:
+        self._client = client
         self._model = model
-        self._queue = audio_queue
-        self._buffer: "deque[tuple[float, str]]" = deque()
-        self._lock = threading.Lock()
-        self._running = threading.Event()
-        self._running.set()
 
-    def run(self) -> None:
-        samples_per_chunk = int(config.CHUNK_SECONDS * config.SAMPLE_RATE)
-        pending: list[np.ndarray] = []
-        collected = 0
+    def transcribe(self, audio: np.ndarray) -> str:
+        if audio.size == 0:
+            return ""
+        wav = io.BytesIO(_wav_bytes_from_float32(audio, config.SAMPLE_RATE))
+        wav.name = "audio.wav"  # OpenAI wykrywa format po nazwie pliku
 
-        while self._running.is_set():
-            try:
-                block = self._queue.get(timeout=0.3)
-            except queue.Empty:
-                continue
+        kwargs = {"model": self._model, "file": wav}
+        if config.TRANSCRIBE_LANGUAGE:
+            kwargs["language"] = config.TRANSCRIBE_LANGUAGE
 
-            pending.append(block)
-            collected += len(block)
-            if collected < samples_per_chunk:
-                continue
-
-            audio = np.concatenate(pending)
-            pending.clear()
-            collected = 0
-
-            try:
-                text = self._transcribe(audio)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[whisper] błąd transkrypcji: {exc}", file=sys.stderr)
-                continue
-
-            if text:
-                with self._lock:
-                    self._buffer.append((time.monotonic(), text))
-                    self._evict_locked()
-
-    def _transcribe(self, audio: np.ndarray) -> str:
-        segments, _info = self._model.transcribe(
-            audio,
-            language=config.WHISPER_LANGUAGE,
-            vad_filter=True,                  # pomija ciszę -> mniej halucynacji
-            beam_size=1,                      # szybciej (wystarcza dla mowy)
-            condition_on_previous_text=False,  # paczki są od siebie niezależne
-        )
-        return " ".join(seg.text.strip() for seg in segments).strip()
-
-    def _evict_locked(self) -> None:
-        """Usuwa wpisy starsze niż BUFFER_SECONDS. Wywoływać pod blokadą."""
-        cutoff = time.monotonic() - config.BUFFER_SECONDS
-        while self._buffer and self._buffer[0][0] < cutoff:
-            self._buffer.popleft()
-
-    def get_transcript(self) -> str:
-        """Zwraca scalony tekst z ostatnich BUFFER_SECONDS sekund."""
-        with self._lock:
-            self._evict_locked()
-            return " ".join(text for _, text in self._buffer).strip()
-
-    def stop(self) -> None:
-        self._running.clear()
+        response = self._client.audio.transcriptions.create(**kwargs)
+        return (response.text or "").strip()
 
 
 # ---------------------------------------------------------------------------
-# RAG: indeks FAISS + LLM (Ollama)
+# RAG: indeks FAISS (embeddingi OpenAI) + LLM (Claude)
 # ---------------------------------------------------------------------------
 class KnowledgeBase:
-    """Wczytuje indeks FAISS oraz model LLM; wyodrębnia pytanie i generuje
+    """Wczytuje indeks FAISS i odpytuje Claude: wyodrębnia pytanie i generuje
     odpowiedź na podstawie znalezionych fragmentów notatek."""
 
-    def __init__(self) -> None:
+    def __init__(self, anthropic_client: "anthropic.Anthropic") -> None:
         if not config.INDEX_DIR.exists():
             raise FileNotFoundError(
                 f"Nie znaleziono indeksu wiedzy w {config.INDEX_DIR}.\n"
                 "Uruchom najpierw:  python ingest.py"
             )
-        self._embeddings = OllamaEmbeddings(model=config.OLLAMA_EMBED_MODEL)
+        embeddings = config.build_embeddings()
         self._vector_store = FAISS.load_local(
             str(config.INDEX_DIR),
-            self._embeddings,
+            embeddings,
             allow_dangerous_deserialization=True,  # indeks budujemy lokalnie
         )
         self._retriever = self._vector_store.as_retriever(
             search_kwargs={"k": config.RETRIEVER_K}
         )
-        self._llm = ChatOllama(
-            model=config.OLLAMA_MODEL,
-            temperature=config.OLLAMA_TEMPERATURE,
-        )
+        self._client = anthropic_client
 
     def extract_question(self, transcript: str) -> str:
-        """Wyciąga z transkrypcji najważniejsze pytanie."""
-        messages = [
-            SystemMessage(content=EXTRACT_SYSTEM_PROMPT),
-            HumanMessage(content=transcript),
-        ]
-        response = self._llm.invoke(messages)
-        return response.content.strip().strip('"').strip()
+        """Wyciąga z transkrypcji najważniejsze pytanie (Claude)."""
+        message = self._client.messages.create(
+            model=config.ANTHROPIC_MODEL,
+            max_tokens=config.ANTHROPIC_MAX_TOKENS_QUESTION,
+            system=EXTRACT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": transcript}],
+        )
+        return _message_text(message).strip().strip('"').strip()
 
     def answer(self, question: str) -> "tuple[str, list[str]]":
         """Zwraca (odpowiedź, lista nazw plików źródłowych)."""
@@ -278,13 +267,17 @@ class KnowledgeBase:
             return "Brak informacji w notatkach.", []
 
         context = "\n\n---\n\n".join(doc.page_content for doc in docs)
-        messages = [
-            SystemMessage(content=ANSWER_SYSTEM_PROMPT),
-            HumanMessage(
-                content=f"FRAGMENTY NOTATEK:\n{context}\n\nPYTANIE:\n{question}"
-            ),
-        ]
-        response = self._llm.invoke(messages)
+        message = self._client.messages.create(
+            model=config.ANTHROPIC_MODEL,
+            max_tokens=config.ANTHROPIC_MAX_TOKENS_ANSWER,
+            system=ANSWER_SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"FRAGMENTY NOTATEK:\n{context}\n\nPYTANIE:\n{question}",
+                }
+            ],
+        )
 
         # Unikalne nazwy źródeł (do pokazania pod odpowiedzią).
         sources: list[str] = []
@@ -293,7 +286,7 @@ class KnowledgeBase:
             name = raw.replace("\\", "/").split("/")[-1]
             if name not in sources:
                 sources.append(name)
-        return response.content.strip(), sources
+        return _message_text(message).strip(), sources
 
 
 # ---------------------------------------------------------------------------
@@ -457,43 +450,49 @@ class OverlayWindow(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Orkiestracja: spina audio, transkrypcję, skrót F12 i pipeline RAG
+# Orkiestracja: spina audio, skrót F12 i pipeline (transkrypcja + RAG)
 # ---------------------------------------------------------------------------
 class Assistant:
     def __init__(self, bridge: UiBridge) -> None:
         self.bridge = bridge
-        self._audio_queue: "queue.Queue[np.ndarray]" = queue.Queue(
-            maxsize=config.AUDIO_QUEUE_MAXSIZE
-        )
+        self.ring = AudioRingBuffer(config.BUFFER_SECONDS, config.SAMPLE_RATE)
         self.listener: "AudioListener | None" = None
-        self.transcriber: "RollingTranscriber | None" = None
+        self.transcriber: "CloudTranscriber | None" = None
         self.kb: "KnowledgeBase | None" = None
         self._busy = threading.Lock()  # gwarantuje jeden pipeline na raz
         self._shut = False
 
     def initialize(self) -> None:
-        """Ciężka inicjalizacja (modele, indeks, nasłuch, skrót).
+        """Ciężka inicjalizacja (klienci API, indeks, nasłuch, skrót).
 
         Uruchamiana w osobnym wątku, dzięki czemu okno GUI pojawia się od razu,
         a użytkownik widzi postęp w pasku statusu.
         """
         try:
-            self.bridge.status.emit(
-                "Ładowanie modelu Whisper… (pierwsze uruchomienie pobiera model)"
-            )
-            model = WhisperModel(
-                config.WHISPER_MODEL,
-                device=config.WHISPER_DEVICE,
-                compute_type=config.WHISPER_COMPUTE,
+            missing = [
+                name
+                for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+                if not os.environ.get(name)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Brak zmiennych środowiskowych: "
+                    + ", ".join(missing)
+                    + ". Ustaw je przed uruchomieniem (patrz README)."
+                )
+
+            self.bridge.status.emit("Łączenie z usługami (Claude, OpenAI)…")
+            openai_client = OpenAI()
+            anthropic_client = anthropic.Anthropic()
+            self.transcriber = CloudTranscriber(
+                openai_client, config.OPENAI_TRANSCRIBE_MODEL
             )
 
             self.bridge.status.emit("Wczytywanie bazy wiedzy (FAISS)…")
-            self.kb = KnowledgeBase()
+            self.kb = KnowledgeBase(anthropic_client)
 
             self.bridge.status.emit("Uruchamianie nasłuchu mikrofonu…")
-            self.transcriber = RollingTranscriber(model, self._audio_queue)
-            self.transcriber.start()
-            self.listener = AudioListener(self._audio_queue)
+            self.listener = AudioListener(self.ring)
             self.listener.start()
 
             self._register_hotkey()
@@ -525,9 +524,9 @@ class Assistant:
         ).start()
 
     def _run_pipeline(self) -> None:
-        """Sekwencja wyzwalacza F12: bufor -> pytanie -> RAG -> odpowiedź.
+        """Sekwencja F12: bufor audio -> transkrypcja -> pytanie -> RAG -> odpowiedź.
 
-        Cała ciężka praca dzieje się tutaj, w osobnym wątku — GUI pozostaje
+        Cała ciężka praca (sieć) dzieje się tutaj, w osobnym wątku — GUI pozostaje
         responsywne, a wyniki trafiają do okna wyłącznie przez sygnały Qt.
         """
         if not self._busy.acquire(blocking=False):
@@ -537,24 +536,36 @@ class Assistant:
                 self.bridge.error.emit("Asystent jeszcze się uruchamia…")
                 return
 
-            self.bridge.status.emit("Analizuję ostatnie sekundy mowy…")
-            transcript = self.transcriber.get_transcript()
-            if not transcript:
+            self.bridge.status.emit("Pobieram ostatnie sekundy dźwięku…")
+            audio = self.ring.snapshot()
+            if audio.size == 0:
                 self.bridge.error.emit(
                     "Bufor pusty — mów do mikrofonu i spróbuj ponownie."
                 )
                 return
 
-            self.bridge.status.emit("Wyodrębniam pytanie…")
+            self.bridge.status.emit("Transkrypcja mowy (OpenAI)…")
+            transcript = self.transcriber.transcribe(audio)
+            if not transcript:
+                self.bridge.error.emit("Nie rozpoznano mowy. Spróbuj ponownie.")
+                return
+
+            self.bridge.status.emit("Wyodrębniam pytanie (Claude)…")
             question = self.kb.extract_question(transcript)
             if not question:
                 self.bridge.error.emit("Nie udało się wyodrębnić pytania.")
                 return
             self.bridge.question.emit(question)
 
-            self.bridge.status.emit("Szukam w notatkach i generuję odpowiedź…")
+            self.bridge.status.emit("Szukam w notatkach i generuję odpowiedź (Claude)…")
             answer, sources = self.kb.answer(question)
             self.bridge.result.emit(answer, sources)
+        except anthropic.APIError as exc:
+            self.bridge.error.emit(f"Błąd Claude API: {exc}")
+            print(f"[pipeline] anthropic: {exc}", file=sys.stderr)
+        except OpenAIError as exc:
+            self.bridge.error.emit(f"Błąd OpenAI API: {exc}")
+            print(f"[pipeline] openai: {exc}", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             self.bridge.error.emit(f"Błąd: {exc}")
             print(f"[pipeline] {exc}", file=sys.stderr)
@@ -562,7 +573,7 @@ class Assistant:
             self._busy.release()
 
     def shutdown(self) -> None:
-        """Porządne zatrzymanie wątków i zwolnienie zasobów (idempotentne)."""
+        """Porządne zatrzymanie nasłuchu i zwolnienie zasobów (idempotentne)."""
         if self._shut:
             return
         self._shut = True
@@ -572,9 +583,6 @@ class Assistant:
             pass
         if self.listener is not None:
             self.listener.stop()
-        if self.transcriber is not None:
-            self.transcriber.stop()
-            self.transcriber.join(timeout=2.0)
 
 
 def main() -> int:
